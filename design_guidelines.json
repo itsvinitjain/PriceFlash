@@ -1,0 +1,214 @@
+{
+  "project_name": "PriceFlash",
+  "design_philosophy": {
+    "identity": "E1: The Anti-AI Designer",
+    "core_concept": "Cyberpunk Utility / The Shopping Terminal",
+    "vibe": "Instant, High-Contrast, Data-Dense, Electric",
+    "archetype": "ELECTRIC & NEON",
+    "principles": [
+      "Speed is the feature: Animations must be tight (150-200ms).",
+      "Black is not just #000: Use depth (#0A0A0F -> #121218 -> #1A1A24).",
+      "Neon signals value: Use electric colors ONLY for savings and actions.",
+      "Density is luxury: Don't be afraid of tight data, but keep it legible."
+    ]
+  },
+  "typography": {
+    "font_family": {
+      "heading": "System Sans-Serif (iOS: San Francisco, Android: Roboto) - Weight: 800/900",
+      "body": "System Sans-Serif - Weight: 400/500",
+      "mono": "System Monospace (iOS: Menlo, Android: Monospace) - For prices and timers"
+    },
+    "scale": {
+      "xs": 10,
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24,
+      "3xl": 30,
+      "4xl": 36
+    },
+    "styles": {
+      "h1": {
+        "fontSize": 32,
+        "fontWeight": "800",
+        "color": "#FFFFFF",
+        "letterSpacing": -0.5,
+        "textTransform": "uppercase"
+      },
+      "h2": {
+        "fontSize": 24,
+        "fontWeight": "700",
+        "color": "#FFFFFF",
+        "letterSpacing": -0.3
+      },
+      "price_huge": {
+        "fontSize": 36,
+        "fontWeight": "900",
+        "color": "#CCFF00",
+        "fontVariant": ["tabular-nums"]
+      },
+      "label_tiny": {
+        "fontSize": 10,
+        "fontWeight": "700",
+        "color": "#71717A",
+        "textTransform": "uppercase",
+        "letterSpacing": 1
+      }
+    }
+  },
+  "colors": {
+    "background": {
+      "main": "#0A0A0F",
+      "card": "#121218",
+      "card_highlight": "#1C1C26",
+      "overlay": "rgba(0, 0, 0, 0.85)"
+    },
+    "primary": {
+      "main": "#CCFF00",
+      "hover": "#B3E600",
+      "text_on_primary": "#000000"
+    },
+    "secondary": {
+      "main": "#00F0FF",
+      "dim": "rgba(0, 240, 255, 0.1)"
+    },
+    "status": {
+      "success": "#00FF94",
+      "error": "#FF0055",
+      "warning": "#FFB800"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "tertiary": "#52525B"
+    },
+    "border": {
+      "subtle": "#27272A",
+      "active": "#3F3F46"
+    }
+  },
+  "layout_and_spacing": {
+    "grid_system": "Flexbox (React Native default)",
+    "spacing": {
+      "1": 4,
+      "2": 8,
+      "3": 12,
+      "4": 16,
+      "5": 20,
+      "6": 24,
+      "8": 32,
+      "10": 40
+    },
+    "border_radius": {
+      "sm": 4,
+      "md": 8,
+      "lg": 12,
+      "full": 9999
+    },
+    "containers": {
+      "screen_padding": 16,
+      "card_padding": 16
+    }
+  },
+  "visual_enhancers": {
+    "shadows": {
+      "glow": {
+        "shadowColor": "#CCFF00",
+        "shadowOffset": { "width": 0, "height": 0 },
+        "shadowOpacity": 0.3,
+        "shadowRadius": 10,
+        "elevation": 5
+      },
+      "card_depth": {
+        "shadowColor": "#000",
+        "shadowOffset": { "width": 0, "height": 4 },
+        "shadowOpacity": 0.5,
+        "shadowRadius": 8,
+        "elevation": 4
+      }
+    },
+    "gradients": "Avoid full screen gradients. Use subtle radial gradients in backgrounds using SVGs if possible, or keep it flat and clean for performance."
+  },
+  "components": {
+    "buttons": {
+      "primary": {
+        "backgroundColor": "#CCFF00",
+        "borderRadius": 9999,
+        "height": 56,
+        "justifyContent": "center",
+        "alignItems": "center",
+        "shadowColor": "#CCFF00",
+        "shadowOpacity": 0.2,
+        "shadowRadius": 8
+      },
+      "secondary": {
+        "backgroundColor": "#27272A",
+        "borderRadius": 9999,
+        "height": 48,
+        "justifyContent": "center",
+        "alignItems": "center"
+      }
+    },
+    "cards": {
+      "result_card": {
+        "backgroundColor": "#121218",
+        "borderRadius": 12,
+        "borderWidth": 1,
+        "borderColor": "#27272A",
+        "padding": 16,
+        "marginBottom": 12
+      }
+    },
+    "inputs": {
+      "search_bar": {
+        "backgroundColor": "#18181B",
+        "borderRadius": 12,
+        "height": 56,
+        "paddingHorizontal": 16,
+        "color": "#FFFFFF",
+        "borderWidth": 1,
+        "borderColor": "#27272A"
+      }
+    }
+  },
+  "motion": {
+    "guidelines": "Use React Native Animated API or Reanimated. Animations should be snappy.",
+    "transitions": {
+      "press": "Scale down to 0.98 on pressIn, back to 1 on pressOut.",
+      "fade_in": "Opacity 0 -> 1 over 300ms.",
+      "slide_up": "TranslateY 20 -> 0 over 300ms."
+    }
+  },
+  "media": {
+    "logos": {
+      "blinkit": "https://logo.clearbit.com/blinkit.com",
+      "zepto": "https://logo.clearbit.com/zeptonow.com",
+      "swiggy": "https://logo.clearbit.com/swiggy.com",
+      "bigbasket": "https://logo.clearbit.com/bigbasket.com",
+      "dmart": "https://logo.clearbit.com/dmart.in",
+      "jiomart": "https://logo.clearbit.com/jiomart.com",
+      "amazon": "https://logo.clearbit.com/amazon.in",
+      "flipkart": "https://logo.clearbit.com/flipkart.com"
+    },
+    "icons": "Use @expo/vector-icons (Feather or Ionicons preferred for thin, sharp look)."
+  },
+  "accessibility": {
+    "contrast": "Ensure text is #FFFFFF or #E4E4E7 on dark backgrounds. Avoid dark grey on black.",
+    "touch_targets": "Minimum 44x44 points for all interactive elements.",
+    "testing": "All interactive elements MUST have a 'testID' (React Native prop) or 'accessibilityLabel'."
+  },
+  "instructions_to_main_agent": {
+    "core_rule": "Do NOT use HTML elements (div, span). Use View, Text, TouchableOpacity, Image.",
+    "styling": "Use StyleSheet.create(). Do not use inline styles for static values.",
+    "safe_area": "Always wrap screen content in SafeAreaView (from react-native-safe-area-context) or use appropriate padding.",
+    "icons": "Import from @expo/vector-icons. Example: import { Feather } from '@expo/vector-icons';",
+    "mock_data": "Create a robust mock data file for the 8 platforms with varied prices and delivery times to show off the sorting logic."
+  },
+  "universal_guidelines": [
+    "No gradients on text (hard to do in RN, avoid complexity).",
+    "Use distinct visual weight for 'Best Price' vs 'Fastest Delivery'.",
+    "Ensure keyboard handling (KeyboardAvoidingView) for the search input.",
+    "Redirect screen must feel like a 'hyperspace jump' - fast, pulsing, exciting."
+  ]
+}
