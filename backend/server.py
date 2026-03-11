@@ -7,7 +7,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import asyncio
 import json
 import time
@@ -15,6 +15,8 @@ import random
 import re
 import httpx
 from urllib.parse import quote
+from apify_client import ApifyClientAsync
+from thefuzz import fuzz
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -29,9 +31,14 @@ api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ========== APIFY CONFIG ==========
+APIFY_API_KEY = os.environ.get('APIFY_API_KEY', '')
+ZEPTO_ACTOR = "krazee_kaushik/zepto-scraper"
+BLINKIT_ACTOR = "krazee_kaushik/blinkit-search-results-scraper"
+
 # ========== IN-MEMORY CACHE ==========
 _cache: dict = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 600  # 10 minutes (scraping is expensive)
 
 
 def get_cache(key: str):
@@ -48,20 +55,6 @@ def set_cache(key: str, data: dict):
 
 
 # ========== PLATFORM CONFIGURATION ==========
-# TODO: Replace mock data with real scraper API calls.
-# Each platform entry below contains all info needed to build a scraper.
-# To integrate a real API, create a scraper function per platform that:
-#   - Takes (query: str, pincode: str) as input
-#   - Returns a dict matching the SearchResult schema below
-#   - Handles errors gracefully (return None on failure)
-#
-# Example scraper signature:
-#   async def scrape_blinkit(query: str, pincode: str) -> Optional[dict]:
-#       # Call your scraping API here
-#       # API should accept: query, pincode/location
-#       # API should return: product_name, price, mrp, delivery_minutes, in_stock
-#       pass
-
 PLATFORMS = [
     {
         "id": "blinkit",
@@ -70,6 +63,7 @@ PLATFORMS = [
         "base_delivery_mins": 10,
         "delivery_fee": 0,
         "deep_link_template": "https://blinkit.com/s/?q={query}",
+        "active": True,
     },
     {
         "id": "zepto",
@@ -78,6 +72,7 @@ PLATFORMS = [
         "base_delivery_mins": 10,
         "delivery_fee": 0,
         "deep_link_template": "https://www.zeptonow.com/search?query={query}",
+        "active": True,
     },
     {
         "id": "swiggy",
@@ -86,6 +81,7 @@ PLATFORMS = [
         "base_delivery_mins": 15,
         "delivery_fee": 5,
         "deep_link_template": "https://www.swiggy.com/instamart/search?query={query}",
+        "active": False,
     },
     {
         "id": "bigbasket",
@@ -94,6 +90,7 @@ PLATFORMS = [
         "base_delivery_mins": 20,
         "delivery_fee": 0,
         "deep_link_template": "https://www.bigbasket.com/ps/?q={query}",
+        "active": False,
     },
     {
         "id": "dmart",
@@ -102,6 +99,7 @@ PLATFORMS = [
         "base_delivery_mins": 120,
         "delivery_fee": 0,
         "deep_link_template": "https://www.dmart.in/search/{query}",
+        "active": False,
     },
     {
         "id": "jiomart",
@@ -110,6 +108,7 @@ PLATFORMS = [
         "base_delivery_mins": 30,
         "delivery_fee": 0,
         "deep_link_template": "https://www.jiomart.com/search/{query}",
+        "active": False,
     },
     {
         "id": "amazon",
@@ -118,6 +117,7 @@ PLATFORMS = [
         "base_delivery_mins": 120,
         "delivery_fee": 0,
         "deep_link_template": "https://www.amazon.in/s?k={query}&i=amazonfresh",
+        "active": False,
     },
     {
         "id": "flipkart",
@@ -126,238 +126,656 @@ PLATFORMS = [
         "base_delivery_mins": 15,
         "delivery_fee": 0,
         "deep_link_template": "https://www.flipkart.com/search?q={query}&marketplace=MINUTES",
+        "active": False,
     },
 ]
 
-# ========== PRODUCT CATALOG (MOCK DATA) ==========
-# TODO: Replace with real product database or scraper results
-PRODUCT_CATALOG = [
-    {"name": "Amul Butter 500g", "brand": "Amul", "mrp": 285, "keywords": ["amul", "butter", "500g", "500gm", "dairy"]},
-    {"name": "Tata Salt 1kg", "brand": "Tata", "mrp": 28, "keywords": ["tata", "salt", "1kg", "iodised", "namak"]},
-    {"name": "Fortune Sunlite Oil 1L", "brand": "Fortune", "mrp": 155, "keywords": ["fortune", "oil", "sunlite", "1l", "cooking", "sunflower"]},
-    {"name": "Maggi 2-Minute Noodles 280g", "brand": "Maggi", "mrp": 56, "keywords": ["maggi", "noodles", "instant", "280g", "2 minute"]},
-    {"name": "Parle-G Biscuits 800g", "brand": "Parle", "mrp": 80, "keywords": ["parle", "biscuit", "800g", "parleg", "glucose"]},
-    {"name": "Tropicana Orange Juice 1L", "brand": "Tropicana", "mrp": 120, "keywords": ["tropicana", "orange", "juice", "1l", "1 litre"]},
-    {"name": "Haldiram's Aloo Bhujia 400g", "brand": "Haldiram", "mrp": 140, "keywords": ["haldiram", "aloo", "bhujia", "400g", "snack", "namkeen"]},
-    {"name": "Surf Excel Matic 2kg", "brand": "Surf Excel", "mrp": 430, "keywords": ["surf", "excel", "matic", "2kg", "detergent", "washing"]},
-    {"name": "Amul Milk 1L Toned", "brand": "Amul", "mrp": 60, "keywords": ["amul", "milk", "1l", "toned", "dairy"]},
-    {"name": "Aashirvaad Atta 5kg", "brand": "Aashirvaad", "mrp": 300, "keywords": ["aashirvaad", "atta", "5kg", "wheat", "flour", "whole wheat"]},
-    {"name": "Coca-Cola 750ml", "brand": "Coca-Cola", "mrp": 40, "keywords": ["coca", "cola", "coke", "750ml", "soft drink", "cold drink"]},
-    {"name": "Lay's Classic Salted 90g", "brand": "Lay's", "mrp": 30, "keywords": ["lays", "chips", "classic", "salted", "90g", "potato"]},
-    {"name": "Britannia Good Day 600g", "brand": "Britannia", "mrp": 120, "keywords": ["britannia", "good day", "butter", "biscuit", "600g", "cookies"]},
-    {"name": "Nescafe Classic 100g", "brand": "Nescafe", "mrp": 295, "keywords": ["nescafe", "coffee", "classic", "100g", "instant"]},
-    {"name": "Vim Liquid 500ml", "brand": "Vim", "mrp": 99, "keywords": ["vim", "liquid", "dish", "wash", "500ml", "dishwash"]},
-    {"name": "Dettol Soap 125g Pack of 4", "brand": "Dettol", "mrp": 198, "keywords": ["dettol", "soap", "125g", "4 pack", "antibacterial"]},
-    {"name": "Mother Dairy Dahi 400g", "brand": "Mother Dairy", "mrp": 45, "keywords": ["mother dairy", "dahi", "curd", "400g", "yogurt"]},
-    {"name": "Kurkure Masala Munch 100g", "brand": "Kurkure", "mrp": 20, "keywords": ["kurkure", "masala", "munch", "100g", "snack"]},
-    {"name": "Kissan Tomato Ketchup 500g", "brand": "Kissan", "mrp": 115, "keywords": ["kissan", "ketchup", "tomato", "500g", "sauce"]},
-    {"name": "Cadbury Dairy Milk Silk 150g", "brand": "Cadbury", "mrp": 180, "keywords": ["cadbury", "dairy milk", "silk", "chocolate", "150g"]},
-    {"name": "Colgate MaxFresh 150g", "brand": "Colgate", "mrp": 95, "keywords": ["colgate", "maxfresh", "toothpaste", "150g"]},
-    {"name": "Rin Liquid 1L", "brand": "Rin", "mrp": 145, "keywords": ["rin", "liquid", "detergent", "1l", "washing"]},
-    {"name": "Thums Up 750ml", "brand": "Thums Up", "mrp": 40, "keywords": ["thums up", "750ml", "soft drink", "cold drink"]},
-    {"name": "Bournvita 500g", "brand": "Bournvita", "mrp": 240, "keywords": ["bournvita", "500g", "health drink", "chocolate"]},
-    {"name": "Pepsodent 200g", "brand": "Pepsodent", "mrp": 79, "keywords": ["pepsodent", "toothpaste", "200g"]},
+ACTIVE_PLATFORMS = [p for p in PLATFORMS if p["active"]]
+INACTIVE_PLATFORMS = [p for p in PLATFORMS if not p["active"]]
+
+# ========== PINCODE TO CITY MAPPING ==========
+PINCODE_CITY_MAP = {
+    "110": "New Delhi",
+    "400": "Mumbai",
+    "560": "Bangalore",
+    "600": "Chennai",
+    "500": "Hyderabad",
+    "700": "Kolkata",
+    "411": "Pune",
+    "380": "Ahmedabad",
+    "302": "Jaipur",
+    "226": "Lucknow",
+    "440": "Nagpur",
+    "462": "Bhopal",
+    "201": "Noida",
+    "122": "Gurugram",
+    "208": "Kanpur",
+    "360": "Rajkot",
+    "395": "Surat",
+    "641": "Coimbatore",
+    "682": "Kochi",
+    "751": "Bhubaneswar",
+    "800": "Patna",
+    "180": "Jammu",
+    "160": "Chandigarh",
+    "452": "Indore",
+    "403": "Goa",
+}
+
+POPULAR_CITIES = [
+    {"name": "Mumbai", "state": "Maharashtra", "pincode": "400001"},
+    {"name": "New Delhi", "state": "Delhi", "pincode": "110001"},
+    {"name": "Bangalore", "state": "Karnataka", "pincode": "560001"},
+    {"name": "Hyderabad", "state": "Telangana", "pincode": "500001"},
+    {"name": "Chennai", "state": "Tamil Nadu", "pincode": "600001"},
+    {"name": "Kolkata", "state": "West Bengal", "pincode": "700001"},
+    {"name": "Pune", "state": "Maharashtra", "pincode": "411001"},
+    {"name": "Ahmedabad", "state": "Gujarat", "pincode": "380001"},
+    {"name": "Gurugram", "state": "Haryana", "pincode": "122001"},
+    {"name": "Noida", "state": "Uttar Pradesh", "pincode": "201301"},
+    {"name": "Jaipur", "state": "Rajasthan", "pincode": "302001"},
+    {"name": "Lucknow", "state": "Uttar Pradesh", "pincode": "226001"},
+    {"name": "Chandigarh", "state": "Punjab", "pincode": "160001"},
+    {"name": "Indore", "state": "Madhya Pradesh", "pincode": "452001"},
+    {"name": "Kochi", "state": "Kerala", "pincode": "682001"},
+    {"name": "Surat", "state": "Gujarat", "pincode": "395001"},
+    {"name": "Coimbatore", "state": "Tamil Nadu", "pincode": "641001"},
+    {"name": "Nagpur", "state": "Maharashtra", "pincode": "440001"},
+    {"name": "Patna", "state": "Bihar", "pincode": "800001"},
+    {"name": "Bhopal", "state": "Madhya Pradesh", "pincode": "462001"},
 ]
 
-# Seed random with a fixed value per query for consistent mock data
-# but different across platforms
+
+def resolve_city_from_pincode(pincode: str) -> str:
+    """Resolve city name from pincode prefix."""
+    for prefix_len in [3]:
+        prefix = pincode[:prefix_len]
+        if prefix in PINCODE_CITY_MAP:
+            return PINCODE_CITY_MAP[prefix]
+    return "Mumbai"  # Default fallback
 
 
 def normalize_query(query: str) -> str:
     return re.sub(r'[^a-z0-9\s]', '', query.lower().strip())
 
 
-def match_products(query: str) -> list:
-    normalized = normalize_query(query)
-    words = normalized.split()
-    matches = []
-    for product in PRODUCT_CATALOG:
-        score = 0
-        product_text = normalize_query(
-            product["name"] + " " + product["brand"] + " " + " ".join(product["keywords"])
-        )
-        for word in words:
-            if word in product_text:
-                score += 1
-        if score > 0:
-            matches.append((product, score))
-    matches.sort(key=lambda x: -x[1])
-    if matches:
-        return [m[0] for m in matches[:3]]
-    # No catalog match — return generic result
-    return [{
-        "name": query.title(),
-        "brand": "Generic",
-        "mrp": random.randint(80, 400),
-        "keywords": words,
-    }]
+# ========== APIFY SCRAPER FUNCTIONS ==========
+async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
+    """Scrape Zepto for products using Apify."""
+    try:
+        apify_client = ApifyClientAsync(APIFY_API_KEY)
+        run_input = {
+            "searchQueries": [query],
+            "locations": [location],
+        }
+        logger.info(f"Starting Zepto scrape: query={query}, location={location}")
+        run = await apify_client.actor(ZEPTO_ACTOR).call(run_input=run_input, timeout_secs=120)
+
+        if not run:
+            logger.error("Zepto scraper returned no run")
+            return []
+
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
+            logger.error("Zepto scraper returned no dataset ID")
+            return []
+
+        items = []
+        dataset_client = apify_client.dataset(dataset_id)
+        list_result = await dataset_client.list_items()
+        if list_result and list_result.items:
+            items = list_result.items
+
+        logger.info(f"Zepto scrape returned {len(items)} items")
+        if items:
+            logger.info(f"Zepto sample item keys: {list(items[0].keys()) if items else 'none'}")
+
+        return items
+    except Exception as e:
+        logger.error(f"Zepto scrape error: {e}")
+        return []
 
 
-def generate_platform_result(platform: dict, product: dict, query: str, seed: int) -> dict:
-    # Use deterministic random per platform+product combo for consistency within a cache window
-    rng = random.Random(seed + hash(platform["id"]))
-    mrp = product["mrp"]
+async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
+    """Scrape Blinkit for products using Apify."""
+    try:
+        apify_client = ApifyClientAsync(APIFY_API_KEY)
+        run_input = {
+            "searchQueries": [query],
+            "locations": [location],
+            "productsLimit": 20,
+        }
+        logger.info(f"Starting Blinkit scrape: query={query}, location={location}")
+        run = await apify_client.actor(BLINKIT_ACTOR).call(run_input=run_input, timeout_secs=120)
 
-    # Platform-specific discount ranges
-    discount_ranges = {
-        "blinkit": (0.03, 0.15),
-        "zepto": (0.05, 0.18),
-        "swiggy": (0.02, 0.12),
-        "bigbasket": (0.05, 0.20),
-        "dmart": (0.10, 0.25),
-        "jiomart": (0.05, 0.15),
-        "amazon": (0.03, 0.12),
-        "flipkart": (0.04, 0.14),
-    }
-    lo, hi = discount_ranges.get(platform["id"], (0.05, 0.15))
-    discount_pct = rng.uniform(lo, hi)
-    price = max(1, round(mrp * (1 - discount_pct)))
-    discount_amount = mrp - price
+        if not run:
+            logger.error("Blinkit scraper returned no run")
+            return []
 
-    delivery_mins = platform["base_delivery_mins"] + rng.randint(-2, 8)
-    delivery_mins = max(5, delivery_mins)
-    delivery_fee = platform["delivery_fee"]
-    in_stock = rng.random() > 0.08  # 92% chance in stock
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
+            logger.error("Blinkit scraper returned no dataset ID")
+            return []
 
-    offer_texts = [
-        f"Save ₹{discount_amount}",
-        f"{round(discount_pct * 100)}% OFF",
-        f"₹{discount_amount} off MRP",
-    ]
+        items = []
+        dataset_client = apify_client.dataset(dataset_id)
+        list_result = await dataset_client.list_items()
+        if list_result and list_result.items:
+            items = list_result.items
 
-    final_price = price + delivery_fee
-    encoded_query = quote(query)
-    deep_link = platform["deep_link_template"].replace("{query}", encoded_query)
+        logger.info(f"Blinkit scrape returned {len(items)} items")
+        if items:
+            logger.info(f"Blinkit sample item keys: {list(items[0].keys()) if items else 'none'}")
+
+        return items
+    except Exception as e:
+        logger.error(f"Blinkit scrape error: {e}")
+        return []
+
+
+def parse_price(val) -> int:
+    """Parse price from various formats (string/int/float)."""
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        cleaned = re.sub(r'[^\d.]', '', val)
+        if cleaned:
+            return int(float(cleaned))
+    return 0
+
+
+def normalize_product_name(name: str) -> str:
+    """Normalize product name for comparison."""
+    if not name:
+        return ""
+    name = name.lower().strip()
+    name = re.sub(r'[^a-z0-9\s]', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name
+
+
+def extract_product_data(item: Dict[str, Any], platform_id: str) -> Optional[Dict[str, Any]]:
+    """Extract standardized product data from raw scraper item."""
+    # Try multiple field name patterns
+    name_fields = ['product_name', 'name', 'title', 'productName', 'product_title', 'Name', 'Title']
+    price_fields = ['price', 'selling_price', 'sellingPrice', 'offer_price', 'offerPrice', 'Price', 'salePrice', 'sale_price']
+    mrp_fields = ['mrp', 'MRP', 'original_price', 'originalPrice', 'actual_price', 'actualPrice', 'Mrp', 'marked_price']
+    delivery_fields = ['delivery_time', 'deliveryTime', 'eta', 'delivery_eta', 'deliveryETA', 'delivery_minutes', 'ETA']
+    stock_fields = ['in_stock', 'inStock', 'available', 'availability', 'stock', 'is_available']
+    image_fields = ['image', 'imageUrl', 'image_url', 'thumbnail', 'productImage', 'product_image', 'Image']
+    brand_fields = ['brand', 'Brand', 'brand_name', 'brandName']
+    quantity_fields = ['quantity', 'weight', 'size', 'pack_size', 'packSize', 'unit']
+
+    product_name = None
+    for f in name_fields:
+        if f in item and item[f]:
+            product_name = str(item[f]).strip()
+            break
+
+    if not product_name:
+        return None
+
+    price = 0
+    for f in price_fields:
+        if f in item and item[f]:
+            price = parse_price(item[f])
+            if price > 0:
+                break
+
+    mrp = 0
+    for f in mrp_fields:
+        if f in item and item[f]:
+            mrp = parse_price(item[f])
+            if mrp > 0:
+                break
+
+    if mrp == 0:
+        mrp = price
+
+    delivery_mins = 10
+    for f in delivery_fields:
+        if f in item and item[f]:
+            val = item[f]
+            if isinstance(val, (int, float)):
+                delivery_mins = int(val)
+            elif isinstance(val, str):
+                nums = re.findall(r'\d+', val)
+                if nums:
+                    delivery_mins = int(nums[0])
+            break
+
+    in_stock = True
+    for f in stock_fields:
+        if f in item:
+            val = item[f]
+            if isinstance(val, bool):
+                in_stock = val
+            elif isinstance(val, str):
+                in_stock = val.lower() not in ['false', 'no', 'out of stock', '0', 'unavailable']
+            elif isinstance(val, (int, float)):
+                in_stock = val > 0
+            break
+
+    image_url = ""
+    for f in image_fields:
+        if f in item and item[f]:
+            image_url = str(item[f])
+            break
+
+    brand = ""
+    for f in brand_fields:
+        if f in item and item[f]:
+            brand = str(item[f]).strip()
+            break
+
+    quantity = ""
+    for f in quantity_fields:
+        if f in item and item[f]:
+            quantity = str(item[f]).strip()
+            break
+
+    discount_amount = max(0, mrp - price)
+    discount_pct = round((discount_amount / mrp * 100)) if mrp > 0 else 0
 
     return {
-        "platform": platform["name"],
-        "platform_id": platform["id"],
-        "platform_color": platform["color"],
-        "product_name": product["name"],
-        "price": price,
+        "product_name": product_name,
+        "brand": brand,
+        "quantity": quantity,
+        "price": price if price > 0 else mrp,
         "mrp": mrp,
-        "discount_text": rng.choice(offer_texts) if discount_amount > 0 else "",
+        "discount_amount": discount_amount,
+        "discount_pct": discount_pct,
         "delivery_minutes": delivery_mins,
-        "delivery_fee": delivery_fee,
-        "final_price": final_price,
         "in_stock": in_stock,
-        "deep_link": deep_link,
-        "match_type": "exact",
+        "image_url": image_url,
+        "platform_id": platform_id,
     }
+
+
+def match_products(zepto_products: List[Dict], blinkit_products: List[Dict]) -> List[Dict]:
+    """Match products across platforms using fuzzy name matching."""
+    matched = []
+    used_blinkit = set()
+
+    for zp in zepto_products:
+        z_name = normalize_product_name(zp["product_name"])
+        if not z_name:
+            continue
+
+        best_match = None
+        best_score = 0
+
+        for idx, bp in enumerate(blinkit_products):
+            if idx in used_blinkit:
+                continue
+            b_name = normalize_product_name(bp["product_name"])
+            if not b_name:
+                continue
+
+            # Use fuzzy matching
+            score = fuzz.token_sort_ratio(z_name, b_name)
+            if score > best_score:
+                best_score = score
+                best_match = (idx, bp)
+
+        if best_match and best_score >= 55:
+            idx, bp = best_match
+            used_blinkit.add(idx)
+
+            # Determine best platform
+            z_price = zp["price"]
+            b_price = bp["price"]
+            if z_price <= b_price:
+                best_platform = "zepto"
+                savings = b_price - z_price
+            else:
+                best_platform = "blinkit"
+                savings = z_price - b_price
+
+            matched.append({
+                "product_name": zp["product_name"],
+                "brand": zp.get("brand", "") or bp.get("brand", ""),
+                "quantity": zp.get("quantity", "") or bp.get("quantity", ""),
+                "image_url": zp.get("image_url", "") or bp.get("image_url", ""),
+                "match_score": best_score,
+                "zepto": {
+                    "product_name": zp["product_name"],
+                    "price": zp["price"],
+                    "mrp": zp["mrp"],
+                    "discount_amount": zp["discount_amount"],
+                    "discount_pct": zp["discount_pct"],
+                    "delivery_minutes": zp["delivery_minutes"],
+                    "in_stock": zp["in_stock"],
+                },
+                "blinkit": {
+                    "product_name": bp["product_name"],
+                    "price": bp["price"],
+                    "mrp": bp["mrp"],
+                    "discount_amount": bp["discount_amount"],
+                    "discount_pct": bp["discount_pct"],
+                    "delivery_minutes": bp["delivery_minutes"],
+                    "in_stock": bp["in_stock"],
+                },
+                "best_platform": best_platform,
+                "price_diff": savings,
+            })
+        else:
+            # Zepto-only product
+            matched.append({
+                "product_name": zp["product_name"],
+                "brand": zp.get("brand", ""),
+                "quantity": zp.get("quantity", ""),
+                "image_url": zp.get("image_url", ""),
+                "match_score": 0,
+                "zepto": {
+                    "product_name": zp["product_name"],
+                    "price": zp["price"],
+                    "mrp": zp["mrp"],
+                    "discount_amount": zp["discount_amount"],
+                    "discount_pct": zp["discount_pct"],
+                    "delivery_minutes": zp["delivery_minutes"],
+                    "in_stock": zp["in_stock"],
+                },
+                "blinkit": None,
+                "best_platform": "zepto",
+                "price_diff": 0,
+            })
+
+    # Add unmatched Blinkit products
+    for idx, bp in enumerate(blinkit_products):
+        if idx not in used_blinkit:
+            matched.append({
+                "product_name": bp["product_name"],
+                "brand": bp.get("brand", ""),
+                "quantity": bp.get("quantity", ""),
+                "image_url": bp.get("image_url", ""),
+                "match_score": 0,
+                "zepto": None,
+                "blinkit": {
+                    "product_name": bp["product_name"],
+                    "price": bp["price"],
+                    "mrp": bp["mrp"],
+                    "discount_amount": bp["discount_amount"],
+                    "discount_pct": bp["discount_pct"],
+                    "delivery_minutes": bp["delivery_minutes"],
+                    "in_stock": bp["in_stock"],
+                },
+                "best_platform": "blinkit",
+                "price_diff": 0,
+            })
+
+    # Sort: matched products first (by match_score desc), then by lowest price
+    matched.sort(key=lambda x: (
+        -x["match_score"],
+        min(
+            x["zepto"]["price"] if x["zepto"] else 99999,
+            x["blinkit"]["price"] if x["blinkit"] else 99999
+        )
+    ))
+
+    return matched
 
 
 # ========== PYDANTIC MODELS ==========
 class SearchRequest(BaseModel):
     query: str
-    pincode: str = "110001"
+    pincode: str = "400001"
+    location: str = ""
 
 
-class SearchResult(BaseModel):
-    platform: str
-    platform_id: str
-    platform_color: str
-    product_name: str
-    price: int
-    mrp: int
-    discount_text: str
-    delivery_minutes: int
-    delivery_fee: int
-    final_price: int
-    in_stock: bool
-    deep_link: str
-    match_type: str
-
-
-class SearchResponse(BaseModel):
+class CompareResponse(BaseModel):
     query: str
-    pincode: str
-    result_count: int
-    results: List[SearchResult]
-    sorted_by: str = "final_price"
+    location: str
+    products: List[Dict[str, Any]]
+    active_platforms: List[str]
+    inactive_platforms: List[Dict[str, Any]]
+    scrape_time_seconds: float
     cached: bool = False
+    zepto_count: int = 0
+    blinkit_count: int = 0
+    matched_count: int = 0
 
 
 # ========== API ENDPOINTS ==========
 @api_router.get("/")
 async def root():
-    return {"message": "PriceFlash API", "version": "1.0"}
+    return {"message": "PriceFlash API", "version": "2.0"}
 
 
 @api_router.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "apify_configured": bool(APIFY_API_KEY)}
 
 
-@api_router.post("/search", response_model=SearchResponse)
+@api_router.get("/platforms")
+async def get_platforms():
+    """Get all platforms with their active status."""
+    return {
+        "platforms": [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "color": p["color"],
+                "active": p["active"],
+            }
+            for p in PLATFORMS
+        ],
+        "active_count": len(ACTIVE_PLATFORMS),
+        "total_count": len(PLATFORMS),
+    }
+
+
+@api_router.get("/cities")
+async def get_cities(q: str = Query("", description="Search query")):
+    """Get list of popular cities, optionally filtered."""
+    if q:
+        q_lower = q.lower()
+        filtered = [c for c in POPULAR_CITIES if q_lower in c["name"].lower() or q_lower in c["state"].lower()]
+        return {"cities": filtered}
+    return {"cities": POPULAR_CITIES}
+
+
+@api_router.get("/resolve-pincode")
+async def resolve_pincode(pincode: str = Query(...)):
+    """Resolve pincode to city name."""
+    city = resolve_city_from_pincode(pincode)
+    return {"city": city, "pincode": pincode}
+
+
+@api_router.post("/search", response_model=CompareResponse)
 async def search_products(request: SearchRequest):
     """
-    Search for a product across all 8 platforms.
-
-    TODO: Replace mock data generation with real scraper API calls.
-    Expected scraper API contract:
-        POST your-scraper-api.com/scrape
-        Body: { "platform": "blinkit", "query": "amul butter", "pincode": "110001" }
-        Response: {
-            "product_name": str,
-            "price": int,
-            "mrp": int,
-            "discount_text": str,
-            "delivery_minutes": int,
-            "delivery_fee": int,
-            "in_stock": bool
-        }
+    Search and compare products across Zepto and Blinkit using real-time Apify scraping.
+    Returns product-to-product price comparison.
     """
-    cache_key = f"prices:{request.pincode}:{normalize_query(request.query)}"
+    location = request.location or resolve_city_from_pincode(request.pincode)
+    query = request.query.strip()
+
+    cache_key = f"compare:{normalize_query(query)}:{location.lower()}"
     cached = get_cache(cache_key)
     if cached:
         return {**cached, "cached": True}
 
-    products = match_products(request.query)
-    product = products[0]
+    start_time = time.time()
 
-    seed = int(time.time()) // CACHE_TTL  # Same seed within cache window
+    # Scrape both platforms concurrently
+    zepto_raw, blinkit_raw = await asyncio.gather(
+        scrape_zepto(query, location),
+        scrape_blinkit(query, location),
+        return_exceptions=True
+    )
 
-    results = []
-    for platform in PLATFORMS:
-        result = generate_platform_result(platform, product, request.query, seed)
-        results.append(result)
+    # Handle exceptions
+    if isinstance(zepto_raw, Exception):
+        logger.error(f"Zepto scrape exception: {zepto_raw}")
+        zepto_raw = []
+    if isinstance(blinkit_raw, Exception):
+        logger.error(f"Blinkit scrape exception: {blinkit_raw}")
+        blinkit_raw = []
 
-    # Sort: in-stock first, then by final_price ascending
-    results.sort(key=lambda x: (not x["in_stock"], x["final_price"]))
+    # Parse products
+    zepto_products = []
+    for item in (zepto_raw or []):
+        parsed = extract_product_data(item, "zepto")
+        if parsed:
+            zepto_products.append(parsed)
+
+    blinkit_products = []
+    for item in (blinkit_raw or []):
+        parsed = extract_product_data(item, "blinkit")
+        if parsed:
+            blinkit_products.append(parsed)
+
+    # Match products across platforms
+    comparison = match_products(zepto_products, blinkit_products)
+    matched_count = sum(1 for p in comparison if p["zepto"] and p["blinkit"])
+
+    elapsed = round(time.time() - start_time, 1)
+
+    inactive_info = [
+        {"id": p["id"], "name": p["name"], "color": p["color"]}
+        for p in INACTIVE_PLATFORMS
+    ]
 
     response_data = {
-        "query": request.query,
-        "pincode": request.pincode,
-        "result_count": len(results),
-        "results": results,
-        "sorted_by": "final_price",
+        "query": query,
+        "location": location,
+        "products": comparison[:30],  # Limit to 30 products
+        "active_platforms": ["zepto", "blinkit"],
+        "inactive_platforms": inactive_info,
+        "scrape_time_seconds": elapsed,
         "cached": False,
+        "zepto_count": len(zepto_products),
+        "blinkit_count": len(blinkit_products),
+        "matched_count": matched_count,
     }
 
     set_cache(cache_key, response_data)
+
+    # Save to MongoDB for analytics
+    try:
+        await db.searches.insert_one({
+            "query": query,
+            "location": location,
+            "pincode": request.pincode,
+            "zepto_count": len(zepto_products),
+            "blinkit_count": len(blinkit_products),
+            "matched_count": matched_count,
+            "scrape_time": elapsed,
+            "timestamp": time.time(),
+        })
+    except Exception as e:
+        logger.error(f"MongoDB save error: {e}")
+
     return response_data
 
 
 @api_router.get("/search/stream")
-async def search_stream(query: str = Query(...), pincode: str = Query("110001")):
+async def search_stream(
+    query: str = Query(...),
+    pincode: str = Query("400001"),
+    location: str = Query("")
+):
     """
-    SSE endpoint — streams each platform result as it arrives.
-    TODO: Replace mock delays with real async scraper calls.
+    SSE endpoint — streams progress updates and results as scrapers complete.
     """
+    resolved_location = location or resolve_city_from_pincode(pincode)
+
     async def event_generator():
-        products = match_products(query)
-        product = products[0]
-        seed = int(time.time()) // CACHE_TTL
+        start_time = time.time()
 
-        platforms_shuffled = PLATFORMS.copy()
-        random.shuffle(platforms_shuffled)
+        # Check cache first
+        cache_key = f"compare:{normalize_query(query)}:{resolved_location.lower()}"
+        cached = get_cache(cache_key)
+        if cached:
+            yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': 'Loaded from cache!'})}\n\n"
+            yield f"data: {json.dumps({'type': 'result', 'data': {**cached, 'cached': True}})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
 
-        for platform in platforms_shuffled:
-            await asyncio.sleep(random.uniform(0.2, 0.7))
-            result = generate_platform_result(platform, product, query, seed)
-            yield f"data: {json.dumps(result)}\n\n"
+        # Progress: Starting
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 5, 'message': 'Starting price comparison...'})}\n\n"
+        await asyncio.sleep(0.3)
 
-        yield f"data: {json.dumps({'done': True})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': 'Connecting to Zepto & Blinkit...'})}\n\n"
+        await asyncio.sleep(0.3)
+
+        # Scrape Zepto
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 15, 'message': 'Scraping Zepto prices...'})}\n\n"
+
+        zepto_task = asyncio.create_task(scrape_zepto(query, resolved_location))
+        blinkit_task = asyncio.create_task(scrape_blinkit(query, resolved_location))
+
+        # Poll for progress while waiting
+        percent = 15
+        while not zepto_task.done() or not blinkit_task.done():
+            await asyncio.sleep(2)
+            percent = min(percent + 5, 85)
+
+            if zepto_task.done() and not blinkit_task.done():
+                msg = "Zepto done! Waiting for Blinkit..."
+                percent = max(percent, 55)
+            elif blinkit_task.done() and not zepto_task.done():
+                msg = "Blinkit done! Waiting for Zepto..."
+                percent = max(percent, 55)
+            else:
+                msg = "Fetching live prices from both platforms..."
+
+            yield f"data: {json.dumps({'type': 'progress', 'percent': percent, 'message': msg})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 88, 'message': 'Processing results...'})}\n\n"
+
+        # Get results
+        zepto_raw = []
+        blinkit_raw = []
+        try:
+            zepto_raw = zepto_task.result()
+        except Exception as e:
+            logger.error(f"Zepto stream error: {e}")
+        try:
+            blinkit_raw = blinkit_task.result()
+        except Exception as e:
+            logger.error(f"Blinkit stream error: {e}")
+
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 92, 'message': 'Matching products across platforms...'})}\n\n"
+
+        # Parse
+        zepto_products = [p for item in (zepto_raw or []) if (p := extract_product_data(item, "zepto"))]
+        blinkit_products = [p for item in (blinkit_raw or []) if (p := extract_product_data(item, "blinkit"))]
+
+        # Match
+        comparison = match_products(zepto_products, blinkit_products)
+        matched_count = sum(1 for p in comparison if p["zepto"] and p["blinkit"])
+
+        elapsed = round(time.time() - start_time, 1)
+
+        inactive_info = [
+            {"id": p["id"], "name": p["name"], "color": p["color"]}
+            for p in INACTIVE_PLATFORMS
+        ]
+
+        response_data = {
+            "query": query,
+            "location": resolved_location,
+            "products": comparison[:30],
+            "active_platforms": ["zepto", "blinkit"],
+            "inactive_platforms": inactive_info,
+            "scrape_time_seconds": elapsed,
+            "cached": False,
+            "zepto_count": len(zepto_products),
+            "blinkit_count": len(blinkit_products),
+            "matched_count": matched_count,
+        }
+
+        set_cache(cache_key, response_data)
+
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': f'Found {len(comparison)} products in {elapsed}s!'})}\n\n"
+        await asyncio.sleep(0.2)
+
+        yield f"data: {json.dumps({'type': 'result', 'data': response_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -384,7 +802,7 @@ async def geocode(lat: float = Query(...), lng: float = Query(...)):
                     "zoom": 10,
                     "addressdetails": 1,
                 },
-                headers={"User-Agent": "PriceFlash/1.0"},
+                headers={"User-Agent": "PriceFlash/2.0"},
                 timeout=5.0,
             )
             data = resp.json()
@@ -396,7 +814,7 @@ async def geocode(lat: float = Query(...), lng: float = Query(...)):
                 or address.get("state_district")
                 or "Unknown"
             )
-            pincode = address.get("postcode", "110001")
+            pincode = address.get("postcode", "400001")
             return {
                 "city": city,
                 "pincode": pincode,
@@ -404,7 +822,63 @@ async def geocode(lat: float = Query(...), lng: float = Query(...)):
             }
     except Exception as e:
         logger.error(f"Geocode error: {e}")
-        return {"city": "Delhi", "pincode": "110001", "display": "Delhi · 110001"}
+        return {"city": "Mumbai", "pincode": "400001", "display": "Mumbai · 400001"}
+
+
+@api_router.get("/location-search")
+async def location_search(q: str = Query(..., min_length=2)):
+    """Search for locations using Nominatim (free alternative to Google Places)."""
+    try:
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "format": "json",
+                    "q": f"{q}, India",
+                    "limit": 5,
+                    "addressdetails": 1,
+                    "countrycodes": "in",
+                },
+                headers={"User-Agent": "PriceFlash/2.0"},
+                timeout=5.0,
+            )
+            data = resp.json()
+            results = []
+            for item in data:
+                address = item.get("address", {})
+                city = (
+                    address.get("city")
+                    or address.get("town")
+                    or address.get("village")
+                    or address.get("state_district")
+                    or ""
+                )
+                state = address.get("state", "")
+                pincode = address.get("postcode", "")
+                display_name = item.get("display_name", "")
+
+                if city:
+                    results.append({
+                        "city": city,
+                        "state": state,
+                        "pincode": pincode,
+                        "display": f"{city}, {state}" if state else city,
+                        "lat": float(item.get("lat", 0)),
+                        "lng": float(item.get("lon", 0)),
+                    })
+
+            # Deduplicate by city
+            seen = set()
+            unique = []
+            for r in results:
+                if r["city"] not in seen:
+                    seen.add(r["city"])
+                    unique.append(r)
+
+            return {"results": unique}
+    except Exception as e:
+        logger.error(f"Location search error: {e}")
+        return {"results": []}
 
 
 # ========== RECENT SEARCHES (MongoDB) ==========
@@ -414,6 +888,7 @@ async def save_recent_search(data: dict):
     await db.recent_searches.insert_one({
         "query": data.get("query", ""),
         "pincode": data.get("pincode", ""),
+        "location": data.get("location", ""),
         "timestamp": time.time(),
     })
     return {"status": "saved"}

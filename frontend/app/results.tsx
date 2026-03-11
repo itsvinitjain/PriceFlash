@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,110 +6,128 @@ import {
   StyleSheet,
   SafeAreaView,
   FlatList,
-  ActivityIndicator,
+  Linking,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
-import PlatformCard from '../components/PlatformCard';
-import SkeletonCard from '../components/SkeletonCard';
-import { COLORS, PlatformResult } from '../utils/constants';
-import { searchProducts } from '../utils/api';
+import ComparisonCard from '../components/ComparisonCard';
+import ScrapeProgressBar from '../components/ScrapeProgressBar';
+import { COLORS, ComparedProduct, CompareResponse, ProgressEvent } from '../utils/constants';
+import { streamSearch } from '../utils/api';
 
-type SortMode = 'price' | 'fastest' | 'offer';
+type SortMode = 'price' | 'savings' | 'matched';
 
 export default function ResultsScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ query: string; pincode: string }>();
+  const params = useLocalSearchParams<{ query: string; pincode: string; location: string }>();
   const query = params.query || '';
-  const pincode = params.pincode || '110001';
+  const pincode = params.pincode || '400001';
+  const location = params.location || '';
 
-  const [allResults, setAllResults] = useState<PlatformResult[]>([]);
-  const [visibleResults, setVisibleResults] = useState<PlatformResult[]>([]);
+  const [results, setResults] = useState<CompareResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [sortMode, setSortMode] = useState<SortMode>('price');
-  const [fetchTime, setFetchTime] = useState(0);
+  const [progress, setProgress] = useState({ percent: 0, message: 'Initializing...' });
+
+  const cancelRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    fetchResults();
+    startSearch();
+    return () => {
+      if (cancelRef.current) cancelRef.current();
+    };
   }, []);
 
-  const fetchResults = async () => {
+  const startSearch = () => {
     setLoading(true);
     setError('');
-    setVisibleResults([]);
-    const startTime = Date.now();
+    setResults(null);
+    setProgress({ percent: 0, message: 'Initializing...' });
 
-    try {
-      const data = await searchProducts(query, pincode);
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      setFetchTime(parseFloat(elapsed));
-      setAllResults(data.results);
+    if (cancelRef.current) cancelRef.current();
 
-      // Progressive reveal
-      data.results.forEach((result: PlatformResult, index: number) => {
-        setTimeout(() => {
-          setVisibleResults((prev) => [...prev, result]);
-        }, index * 120);
-      });
-
-      setTimeout(() => setLoading(false), data.results.length * 120 + 100);
-    } catch (e) {
-      setError('Failed to fetch results. Try again.');
-      setLoading(false);
-    }
+    cancelRef.current = streamSearch(
+      query,
+      pincode,
+      location,
+      (event: ProgressEvent) => {
+        setProgress({
+          percent: event.percent || 0,
+          message: event.message || '',
+        });
+      },
+      (data: CompareResponse) => {
+        setResults(data);
+        setLoading(false);
+      },
+      (errMsg: string) => {
+        setError(errMsg || 'Failed to fetch results. Try again.');
+        setLoading(false);
+      }
+    );
   };
 
-  const getSortedResults = () => {
-    const sorted = [...visibleResults];
+  const getSortedProducts = (): ComparedProduct[] => {
+    if (!results?.products) return [];
+    const sorted = [...results.products];
     switch (sortMode) {
       case 'price':
         sorted.sort((a, b) => {
-          if (a.in_stock !== b.in_stock) return a.in_stock ? -1 : 1;
-          return a.final_price - b.final_price;
+          const aMin = Math.min(
+            a.zepto?.price ?? 99999,
+            a.blinkit?.price ?? 99999
+          );
+          const bMin = Math.min(
+            b.zepto?.price ?? 99999,
+            b.blinkit?.price ?? 99999
+          );
+          return aMin - bMin;
         });
         break;
-      case 'fastest':
-        sorted.sort((a, b) => {
-          if (a.in_stock !== b.in_stock) return a.in_stock ? -1 : 1;
-          return a.delivery_minutes - b.delivery_minutes;
-        });
+      case 'savings':
+        sorted.sort((a, b) => b.price_diff - a.price_diff);
         break;
-      case 'offer':
+      case 'matched':
         sorted.sort((a, b) => {
-          if (a.in_stock !== b.in_stock) return a.in_stock ? -1 : 1;
-          return (b.mrp - b.price) - (a.mrp - a.price);
+          const aBoth = a.zepto && a.blinkit ? 1 : 0;
+          const bBoth = b.zepto && b.blinkit ? 1 : 0;
+          if (aBoth !== bBoth) return bBoth - aBoth;
+          return b.match_score - a.match_score;
         });
         break;
     }
     return sorted;
   };
 
-  const handleCardPress = (result: PlatformResult) => {
-    router.push({
-      pathname: '/redirect',
-      params: {
-        platform: result.platform,
-        platformId: result.platform_id,
-        platformColor: result.platform_color,
-        productName: result.product_name,
-        finalPrice: String(result.final_price),
-        mrp: String(result.mrp),
-        deepLink: encodeURIComponent(result.deep_link),
-        deliveryMinutes: String(result.delivery_minutes),
-      },
-    });
+  const handlePlatformPress = (platformId: string, productName: string) => {
+    const encodedQuery = encodeURIComponent(productName);
+    let url = '';
+    if (platformId === 'zepto') {
+      url = `https://www.zeptonow.com/search?query=${encodedQuery}`;
+    } else if (platformId === 'blinkit') {
+      url = `https://blinkit.com/s/?q=${encodedQuery}`;
+    }
+    if (url) {
+      Linking.openURL(url).catch(() => {});
+    }
   };
 
-  const sorted = getSortedResults();
-  const inStockCount = allResults.filter((r) => r.in_stock).length;
+  const sorted = getSortedProducts();
+  const matchedCount = results?.matched_count || 0;
+  const totalProducts = results?.products?.length || 0;
 
-  const renderSortPill = (mode: SortMode, label: string) => (
+  const renderSortPill = (mode: SortMode, label: string, icon: string) => (
     <TouchableOpacity
       testID={`sort-${mode}`}
       style={[styles.sortPill, sortMode === mode && styles.sortPillActive]}
       onPress={() => setSortMode(mode)}
     >
+      <Feather
+        name={icon as any}
+        size={12}
+        color={sortMode === mode ? COLORS.primary : COLORS.textSecondary}
+      />
       <Text
         style={[
           styles.sortPillText,
@@ -138,18 +156,24 @@ export default function ResultsScreen() {
           </Text>
           <Text style={styles.metaText}>
             {loading
-              ? 'Searching platforms...'
-              : `${inStockCount} platforms · updated ${fetchTime}s ago`}
+              ? `Scraping live prices · ${location || 'Detecting...'}`
+              : `${totalProducts} products · ${matchedCount} matched · ${results?.scrape_time_seconds}s`}
           </Text>
         </View>
+        {!loading && (
+          <TouchableOpacity style={styles.refreshBtn} onPress={startSearch}>
+            <Feather name="refresh-cw" size={16} color={COLORS.textSecondary} />
+          </TouchableOpacity>
+        )}
       </View>
 
-      {/* Sort Pills */}
-      <View style={styles.sortRow}>
-        {renderSortPill('price', 'Best Price')}
-        {renderSortPill('fastest', 'Fastest')}
-        {renderSortPill('offer', 'Best Offer')}
-      </View>
+      {/* Loading State with Progress Bar */}
+      {loading && (
+        <ScrapeProgressBar
+          percent={progress.percent}
+          message={progress.message}
+        />
+      )}
 
       {/* Error State */}
       {error ? (
@@ -159,70 +183,79 @@ export default function ResultsScreen() {
           <TouchableOpacity
             testID="retry-btn"
             style={styles.retryBtn}
-            onPress={fetchResults}
+            onPress={startSearch}
           >
             <Text style={styles.retryText}>Retry</Text>
           </TouchableOpacity>
         </View>
-      ) : (
-        <FlatList
-          testID="results-list"
-          data={sorted}
-          keyExtractor={(item) => item.platform_id}
-          contentContainerStyle={styles.listContent}
-          renderItem={({ item, index }) => (
-            <PlatformCard
-              result={item}
-              isBest={index === 0 && !loading}
-              onPress={handleCardPress}
-            />
-          )}
-          ListHeaderComponent={
-            loading && sorted.length === 0 ? (
-              <View>
-                {[1, 2, 3, 4, 5].map((i) => (
-                  <SkeletonCard key={i} />
-                ))}
-              </View>
-            ) : null
-          }
-          ListFooterComponent={
-            loading && sorted.length > 0 ? (
-              <View style={styles.loadingMore}>
-                <ActivityIndicator size="small" color={COLORS.primary} />
-                <Text style={styles.loadingText}>
-                  Checking more platforms...
-                </Text>
-              </View>
-            ) : null
-          }
-          ListEmptyComponent={
-            !loading ? (
+      ) : !loading && results ? (
+        <>
+          {/* Stats Row */}
+          <View style={styles.statsRow}>
+            <View style={styles.statPill}>
+              <View style={[styles.statDot, { backgroundColor: COLORS.zepto }]} />
+              <Text style={styles.statText}>Zepto: {results.zepto_count}</Text>
+            </View>
+            <View style={styles.statPill}>
+              <View style={[styles.statDot, { backgroundColor: COLORS.blinkit }]} />
+              <Text style={styles.statText}>Blinkit: {results.blinkit_count}</Text>
+            </View>
+            <View style={styles.statPill}>
+              <Feather name="git-merge" size={10} color={COLORS.success} />
+              <Text style={styles.statText}>Matched: {matchedCount}</Text>
+            </View>
+          </View>
+
+          {/* Sort Pills */}
+          <View style={styles.sortRow}>
+            {renderSortPill('price', 'Cheapest', 'dollar-sign')}
+            {renderSortPill('savings', 'Most Savings', 'trending-down')}
+            {renderSortPill('matched', 'Best Match', 'check-circle')}
+          </View>
+
+          {/* Results List */}
+          <FlatList
+            testID="results-list"
+            data={sorted}
+            keyExtractor={(item, index) => `${item.product_name}-${index}`}
+            contentContainerStyle={styles.listContent}
+            renderItem={({ item, index }) => (
+              <ComparisonCard
+                product={item}
+                index={index}
+                onPlatformPress={handlePlatformPress}
+              />
+            )}
+            ListEmptyComponent={
               <View style={styles.emptyState}>
                 <Feather name="search" size={48} color={COLORS.textTertiary} />
-                <Text style={styles.emptyText}>No results found</Text>
-                <TouchableOpacity
-                  testID="retry-btn-empty"
-                  style={styles.retryBtn}
-                  onPress={fetchResults}
-                >
-                  <Text style={styles.retryText}>Retry</Text>
-                </TouchableOpacity>
+                <Text style={styles.emptyText}>No products found</Text>
+                <Text style={styles.emptySubtext}>
+                  Try a different search term or location
+                </Text>
               </View>
-            ) : null
-          }
-        />
-      )}
-
-      {/* Few Results Warning */}
-      {!loading && inStockCount > 0 && inStockCount < 3 && (
-        <View style={styles.warningBar}>
-          <Feather name="info" size={14} color={COLORS.warning} />
-          <Text style={styles.warningText}>
-            Only {inStockCount} platform{inStockCount > 1 ? 's' : ''} available in your area
-          </Text>
-        </View>
-      )}
+            }
+            ListFooterComponent={
+              results.inactive_platforms.length > 0 ? (
+                <View style={styles.inactiveFooter}>
+                  <Text style={styles.inactiveTitle}>Coming Soon</Text>
+                  <View style={styles.inactiveRow}>
+                    {results.inactive_platforms.map((p) => (
+                      <View
+                        key={p.id}
+                        style={[styles.inactivePlatform, { borderColor: p.color + '33' }]}
+                      >
+                        <View style={[styles.inactiveDot, { backgroundColor: p.color }]} />
+                        <Text style={styles.inactiveName}>{p.name}</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              ) : null
+            }
+          />
+        </>
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -260,6 +293,40 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     marginTop: 2,
   },
+  refreshBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: COLORS.bgCard,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  statsRow: {
+    flexDirection: 'row',
+    paddingHorizontal: 16,
+    gap: 8,
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  statPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: COLORS.bgCard,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  statDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
   sortRow: {
     flexDirection: 'row',
     paddingHorizontal: 16,
@@ -267,7 +334,10 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   sortPill: {
-    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 999,
     backgroundColor: COLORS.bgCard,
@@ -279,7 +349,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   sortPillText: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '600',
     color: COLORS.textSecondary,
   },
@@ -290,52 +360,71 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 32,
   },
-  loadingMore: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 16,
-  },
-  loadingText: {
-    fontSize: 13,
-    color: COLORS.textTertiary,
-  },
   emptyState: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     paddingTop: 80,
-    gap: 16,
+    gap: 12,
   },
   emptyText: {
     fontSize: 16,
     color: COLORS.textSecondary,
+    fontWeight: '600',
+  },
+  emptySubtext: {
+    fontSize: 13,
+    color: COLORS.textTertiary,
   },
   retryBtn: {
     backgroundColor: COLORS.primary,
     paddingHorizontal: 24,
     paddingVertical: 12,
     borderRadius: 999,
+    marginTop: 8,
   },
   retryText: {
     fontSize: 14,
     fontWeight: '700',
     color: '#000',
   },
-  warningBar: {
+  inactiveFooter: {
+    marginTop: 16,
+    padding: 16,
+    backgroundColor: COLORS.bgCard,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  inactiveTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.textTertiary,
+    letterSpacing: 1,
+    marginBottom: 10,
+  },
+  inactiveRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  inactivePlatform: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: 'rgba(255, 184, 0, 0.08)',
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 184, 0, 0.15)',
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    opacity: 0.4,
   },
-  warningText: {
-    fontSize: 12,
-    color: COLORS.warning,
-    fontWeight: '500',
+  inactiveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  inactiveName: {
+    fontSize: 11,
+    color: COLORS.textTertiary,
   },
 });
