@@ -1,0 +1,18 @@
+FROM node:18-alpine
+
+WORKDIR /app/frontend
+
+# Copy package files
+COPY frontend/package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy app files
+COPY frontend/ .
+
+# Expose Expo port
+EXPOSE 8081 19000 19001
+
+# Start Expo
+CMD ["npm", "start"]

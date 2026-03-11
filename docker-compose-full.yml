@@ -1,0 +1,57 @@
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: priceflash-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: priceflash
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - priceflash-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: priceflash-backend
+    ports:
+      - "8000:8000"
+    environment:
+      MONGO_URL: mongodb://mongodb:27017
+      DB_NAME: priceflash
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    networks:
+      - priceflash-network
+    command: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+  # Web interface to test the API without Expo
+  web-ui:
+    image: nginx:alpine
+    container_name: priceflash-web-ui
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend/web-ui.html:/usr/share/nginx/html/index.html:ro
+    networks:
+      - priceflash-network
+    depends_on:
+      - backend
+
+volumes:
+  mongodb_data:
+
+networks:
+  priceflash-network:
+    driver: bridge
