@@ -200,6 +200,10 @@ def normalize_query(query: str) -> str:
 
 
 # ========== APIFY SCRAPER FUNCTIONS ==========
+MAX_PRODUCTS = 5  # Final output limit
+SCRAPE_LIMIT = 15  # Fetch more from scrapers to improve matching
+
+
 async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
     """Scrape Zepto for products using Apify."""
     try:
@@ -209,7 +213,7 @@ async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
             "locations": [location],
         }
         logger.info(f"Starting Zepto scrape: query={query}, location={location}")
-        run = await apify_client.actor(ZEPTO_ACTOR).call(run_input=run_input, timeout_secs=120)
+        run = await apify_client.actor(ZEPTO_ACTOR).call(run_input=run_input, timeout_secs=90)
 
         if not run:
             logger.error("Zepto scraper returned no run")
@@ -222,13 +226,11 @@ async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
 
         items = []
         dataset_client = apify_client.dataset(dataset_id)
-        list_result = await dataset_client.list_items()
+        list_result = await dataset_client.list_items(limit=SCRAPE_LIMIT)
         if list_result and list_result.items:
-            items = list_result.items
+            items = list_result.items[:SCRAPE_LIMIT]
 
-        logger.info(f"Zepto scrape returned {len(items)} items")
-        if items:
-            logger.info(f"Zepto sample item keys: {list(items[0].keys()) if items else 'none'}")
+        logger.info(f"Zepto scrape returned {len(items)} items (limited to {SCRAPE_LIMIT})")
 
         return items
     except Exception as e:
@@ -243,10 +245,10 @@ async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
         run_input = {
             "searchQueries": [query],
             "locations": [location],
-            "productsLimit": 20,
+            "productsLimit": SCRAPE_LIMIT,
         }
         logger.info(f"Starting Blinkit scrape: query={query}, location={location}")
-        run = await apify_client.actor(BLINKIT_ACTOR).call(run_input=run_input, timeout_secs=120)
+        run = await apify_client.actor(BLINKIT_ACTOR).call(run_input=run_input, timeout_secs=90)
 
         if not run:
             logger.error("Blinkit scraper returned no run")
@@ -259,13 +261,11 @@ async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
 
         items = []
         dataset_client = apify_client.dataset(dataset_id)
-        list_result = await dataset_client.list_items()
+        list_result = await dataset_client.list_items(limit=SCRAPE_LIMIT)
         if list_result and list_result.items:
-            items = list_result.items
+            items = list_result.items[:SCRAPE_LIMIT]
 
-        logger.info(f"Blinkit scrape returned {len(items)} items")
-        if items:
-            logger.info(f"Blinkit sample item keys: {list(items[0].keys()) if items else 'none'}")
+        logger.info(f"Blinkit scrape returned {len(items)} items (limited to {SCRAPE_LIMIT})")
 
         return items
     except Exception as e:
@@ -395,7 +395,9 @@ def extract_product_data(item: Dict[str, Any], platform_id: str) -> Optional[Dic
 
 
 def match_products(zepto_products: List[Dict], blinkit_products: List[Dict]) -> List[Dict]:
-    """Match products across platforms using fuzzy name matching."""
+    """Match products across platforms using fuzzy name matching.
+    Fetches more products but returns only top MAX_PRODUCTS with matched pairs prioritized.
+    """
     matched = []
     used_blinkit = set()
 
@@ -414,13 +416,26 @@ def match_products(zepto_products: List[Dict], blinkit_products: List[Dict]) -> 
             if not b_name:
                 continue
 
-            # Use fuzzy matching
-            score = fuzz.token_sort_ratio(z_name, b_name)
-            if score > best_score:
-                best_score = score
+            # Multi-signal matching: name, brand, variant
+            name_score = fuzz.token_sort_ratio(z_name, b_name)
+
+            # Bonus for brand match
+            z_brand = (zp.get("brand") or "").lower().strip()
+            b_brand = (bp.get("brand") or "").lower().strip()
+            brand_bonus = 15 if z_brand and b_brand and (z_brand in b_brand or b_brand in z_brand) else 0
+
+            # Bonus for quantity/variant match
+            z_qty = (zp.get("quantity") or "").lower().strip()
+            b_qty = (bp.get("quantity") or "").lower().strip()
+            qty_bonus = 10 if z_qty and b_qty and z_qty == b_qty else 0
+
+            total_score = name_score + brand_bonus + qty_bonus
+
+            if total_score > best_score:
+                best_score = total_score
                 best_match = (idx, bp)
 
-        if best_match and best_score >= 55:
+        if best_match and best_score >= 50:
             idx, bp = best_match
             used_blinkit.add(idx)
 
@@ -506,9 +521,11 @@ def match_products(zepto_products: List[Dict], blinkit_products: List[Dict]) -> 
                 "price_diff": 0,
             })
 
-    # Sort: matched products first (by match_score desc), then by lowest price
+    # Sort: matched products first (both platforms), then by lowest price
     matched.sort(key=lambda x: (
-        -x["match_score"],
+        0 if (x["zepto"] and x["blinkit"]) else 1,  # Matched pairs first
+        -x["match_score"],                            # Higher match score
+        -(x["price_diff"]),                           # Higher savings
         min(
             x["zepto"]["price"] if x["zepto"] else 99999,
             x["blinkit"]["price"] if x["blinkit"] else 99999
@@ -642,7 +659,7 @@ async def search_products(request: SearchRequest):
     response_data = {
         "query": query,
         "location": location,
-        "products": comparison[:30],  # Limit to 30 products
+        "products": comparison[:MAX_PRODUCTS],  # Limit to top 5 products
         "active_platforms": ["zepto", "blinkit"],
         "inactive_platforms": inactive_info,
         "scrape_time_seconds": elapsed,
@@ -680,6 +697,7 @@ async def search_stream(
 ):
     """
     SSE endpoint — streams progress updates and results as scrapers complete.
+    Uses time-based progress that never gets stuck.
     """
     resolved_location = location or resolve_city_from_pincode(pincode)
 
@@ -708,24 +726,68 @@ async def search_stream(
         zepto_task = asyncio.create_task(scrape_zepto(query, resolved_location))
         blinkit_task = asyncio.create_task(scrape_blinkit(query, resolved_location))
 
-        # Poll for progress while waiting
-        percent = 15
-        while not zepto_task.done() or not blinkit_task.done():
-            await asyncio.sleep(2)
-            percent = min(percent + 5, 85)
+        zepto_done = False
+        blinkit_done = False
+        poll_count = 0
+        MAX_EXPECTED_TIME = 80  # Expected max time in seconds
 
-            if zepto_task.done() and not blinkit_task.done():
-                msg = "Zepto done! Waiting for Blinkit..."
-                percent = max(percent, 55)
-            elif blinkit_task.done() and not zepto_task.done():
-                msg = "Blinkit done! Waiting for Zepto..."
-                percent = max(percent, 55)
+        while not zepto_task.done() or not blinkit_task.done():
+            await asyncio.sleep(1.5)
+            poll_count += 1
+            elapsed = time.time() - start_time
+
+            # Check completion status
+            if zepto_task.done() and not zepto_done:
+                zepto_done = True
+            if blinkit_task.done() and not blinkit_done:
+                blinkit_done = True
+
+            # Calculate progress based on time + completion
+            time_progress = min(elapsed / MAX_EXPECTED_TIME, 0.85) * 100
+            completion_bonus = 0
+            if zepto_done:
+                completion_bonus += 5
+            if blinkit_done:
+                completion_bonus += 5
+
+            percent = min(int(time_progress + completion_bonus), 95)
+
+            # Build descriptive message
+            if zepto_done and blinkit_done:
+                msg = "Both platforms scraped! Processing..."
+                percent = 92
+            elif zepto_done and not blinkit_done:
+                z_count = 0
+                try:
+                    z_result = zepto_task.result()
+                    z_count = len(z_result) if z_result else 0
+                except Exception:
+                    pass
+                msg = f"Zepto done ({z_count} products)! Waiting for Blinkit..."
+                percent = max(percent, 60)
+            elif blinkit_done and not zepto_done:
+                b_count = 0
+                try:
+                    b_result = blinkit_task.result()
+                    b_count = len(b_result) if b_result else 0
+                except Exception:
+                    pass
+                msg = f"Blinkit done ({b_count} products)! Waiting for Zepto..."
+                percent = max(percent, 60)
             else:
-                msg = "Fetching live prices from both platforms..."
+                elapsed_int = int(elapsed)
+                if elapsed_int < 10:
+                    msg = "Launching scrapers on both platforms..."
+                elif elapsed_int < 25:
+                    msg = "Scraping live prices from Zepto & Blinkit..."
+                elif elapsed_int < 45:
+                    msg = "Still fetching products... almost there!"
+                else:
+                    msg = f"Scraping in progress... ({elapsed_int}s elapsed)"
 
             yield f"data: {json.dumps({'type': 'progress', 'percent': percent, 'message': msg})}\n\n"
 
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 88, 'message': 'Processing results...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 94, 'message': 'Processing results...'})}\n\n"
 
         # Get results
         zepto_raw = []
@@ -739,7 +801,7 @@ async def search_stream(
         except Exception as e:
             logger.error(f"Blinkit stream error: {e}")
 
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 92, 'message': 'Matching products across platforms...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 96, 'message': 'Matching products across platforms...'})}\n\n"
 
         # Parse
         zepto_products = [p for item in (zepto_raw or []) if (p := extract_product_data(item, "zepto"))]
@@ -759,7 +821,7 @@ async def search_stream(
         response_data = {
             "query": query,
             "location": resolved_location,
-            "products": comparison[:30],
+            "products": comparison[:MAX_PRODUCTS],
             "active_platforms": ["zepto", "blinkit"],
             "inactive_platforms": inactive_info,
             "scrape_time_seconds": elapsed,
