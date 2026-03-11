@@ -200,12 +200,13 @@ def normalize_query(query: str) -> str:
 
 
 # ========== APIFY SCRAPER FUNCTIONS ==========
-MAX_PRODUCTS = 5  # Final output limit
-SCRAPE_LIMIT = 15  # Fetch more from scrapers to improve matching
+MAX_PRODUCTS = 5   # Final output limit
+SCRAPE_LIMIT = 5   # Scrape only 5 products per platform
+PLATFORM_TIMEOUT = 75  # Hard timeout per platform (Zepto needs ~60s)
 
 
 async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
-    """Scrape Zepto for products using Apify."""
+    """Scrape Zepto for products using Apify. Hard timeout to prevent stuck."""
     try:
         apify_client = ApifyClientAsync(APIFY_API_KEY)
         run_input = {
@@ -213,7 +214,10 @@ async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
             "locations": [location],
         }
         logger.info(f"Starting Zepto scrape: query={query}, location={location}")
-        run = await apify_client.actor(ZEPTO_ACTOR).call(run_input=run_input, timeout_secs=90)
+        run = await asyncio.wait_for(
+            apify_client.actor(ZEPTO_ACTOR).call(run_input=run_input, timeout_secs=PLATFORM_TIMEOUT),
+            timeout=PLATFORM_TIMEOUT
+        )
 
         if not run:
             logger.error("Zepto scraper returned no run")
@@ -230,16 +234,18 @@ async def scrape_zepto(query: str, location: str) -> List[Dict[str, Any]]:
         if list_result and list_result.items:
             items = list_result.items[:SCRAPE_LIMIT]
 
-        logger.info(f"Zepto scrape returned {len(items)} items (limited to {SCRAPE_LIMIT})")
-
+        logger.info(f"Zepto scrape returned {len(items)} items")
         return items
+    except asyncio.TimeoutError:
+        logger.warning(f"Zepto scrape TIMED OUT after {PLATFORM_TIMEOUT}s")
+        return []
     except Exception as e:
         logger.error(f"Zepto scrape error: {e}")
         return []
 
 
 async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
-    """Scrape Blinkit for products using Apify."""
+    """Scrape Blinkit for products using Apify. Hard timeout to prevent stuck."""
     try:
         apify_client = ApifyClientAsync(APIFY_API_KEY)
         run_input = {
@@ -248,7 +254,10 @@ async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
             "productsLimit": SCRAPE_LIMIT,
         }
         logger.info(f"Starting Blinkit scrape: query={query}, location={location}")
-        run = await apify_client.actor(BLINKIT_ACTOR).call(run_input=run_input, timeout_secs=90)
+        run = await asyncio.wait_for(
+            apify_client.actor(BLINKIT_ACTOR).call(run_input=run_input, timeout_secs=PLATFORM_TIMEOUT),
+            timeout=PLATFORM_TIMEOUT
+        )
 
         if not run:
             logger.error("Blinkit scraper returned no run")
@@ -265,9 +274,11 @@ async def scrape_blinkit(query: str, location: str) -> List[Dict[str, Any]]:
         if list_result and list_result.items:
             items = list_result.items[:SCRAPE_LIMIT]
 
-        logger.info(f"Blinkit scrape returned {len(items)} items (limited to {SCRAPE_LIMIT})")
-
+        logger.info(f"Blinkit scrape returned {len(items)} items")
         return items
+    except asyncio.TimeoutError:
+        logger.warning(f"Blinkit scrape TIMED OUT after {PLATFORM_TIMEOUT}s")
+        return []
     except Exception as e:
         logger.error(f"Blinkit scrape error: {e}")
         return []
@@ -696,10 +707,11 @@ async def search_stream(
     location: str = Query("")
 ):
     """
-    SSE endpoint — streams progress updates and results as scrapers complete.
-    Uses time-based progress that never gets stuck.
+    SSE endpoint — streams progress. Sends partial results as each platform finishes.
+    Hard total timeout of 60s. Never gets stuck.
     """
     resolved_location = location or resolve_city_from_pincode(pincode)
+    TOTAL_TIMEOUT = 80
 
     async def event_generator():
         start_time = time.time()
@@ -713,104 +725,91 @@ async def search_stream(
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-        # Progress: Starting
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 5, 'message': 'Starting price comparison...'})}\n\n"
-        await asyncio.sleep(0.3)
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 5, 'message': 'Starting live price scraping...'})}\n\n"
+        await asyncio.sleep(0.2)
 
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': 'Connecting to Zepto & Blinkit...'})}\n\n"
-        await asyncio.sleep(0.3)
-
-        # Scrape Zepto
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 15, 'message': 'Scraping Zepto prices...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 10, 'message': 'Launching Zepto & Blinkit scrapers...'})}\n\n"
 
         zepto_task = asyncio.create_task(scrape_zepto(query, resolved_location))
         blinkit_task = asyncio.create_task(scrape_blinkit(query, resolved_location))
 
         zepto_done = False
         blinkit_done = False
-        poll_count = 0
-        MAX_EXPECTED_TIME = 80  # Expected max time in seconds
-
-        while not zepto_task.done() or not blinkit_task.done():
-            await asyncio.sleep(1.5)
-            poll_count += 1
-            elapsed = time.time() - start_time
-
-            # Check completion status
-            if zepto_task.done() and not zepto_done:
-                zepto_done = True
-            if blinkit_task.done() and not blinkit_done:
-                blinkit_done = True
-
-            # Calculate progress based on time + completion
-            time_progress = min(elapsed / MAX_EXPECTED_TIME, 0.85) * 100
-            completion_bonus = 0
-            if zepto_done:
-                completion_bonus += 5
-            if blinkit_done:
-                completion_bonus += 5
-
-            percent = min(int(time_progress + completion_bonus), 95)
-
-            # Build descriptive message
-            if zepto_done and blinkit_done:
-                msg = "Both platforms scraped! Processing..."
-                percent = 92
-            elif zepto_done and not blinkit_done:
-                z_count = 0
-                try:
-                    z_result = zepto_task.result()
-                    z_count = len(z_result) if z_result else 0
-                except Exception:
-                    pass
-                msg = f"Zepto done ({z_count} products)! Waiting for Blinkit..."
-                percent = max(percent, 60)
-            elif blinkit_done and not zepto_done:
-                b_count = 0
-                try:
-                    b_result = blinkit_task.result()
-                    b_count = len(b_result) if b_result else 0
-                except Exception:
-                    pass
-                msg = f"Blinkit done ({b_count} products)! Waiting for Zepto..."
-                percent = max(percent, 60)
-            else:
-                elapsed_int = int(elapsed)
-                if elapsed_int < 10:
-                    msg = "Launching scrapers on both platforms..."
-                elif elapsed_int < 25:
-                    msg = "Scraping live prices from Zepto & Blinkit..."
-                elif elapsed_int < 45:
-                    msg = "Still fetching products... almost there!"
-                else:
-                    msg = f"Scraping in progress... ({elapsed_int}s elapsed)"
-
-            yield f"data: {json.dumps({'type': 'progress', 'percent': percent, 'message': msg})}\n\n"
-
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 94, 'message': 'Processing results...'})}\n\n"
-
-        # Get results
         zepto_raw = []
         blinkit_raw = []
-        try:
-            zepto_raw = zepto_task.result()
-        except Exception as e:
-            logger.error(f"Zepto stream error: {e}")
-        try:
-            blinkit_raw = blinkit_task.result()
-        except Exception as e:
-            logger.error(f"Blinkit stream error: {e}")
+        poll_idx = 0
 
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 96, 'message': 'Matching products across platforms...'})}\n\n"
+        while True:
+            await asyncio.sleep(1.2)
+            elapsed = time.time() - start_time
+            poll_idx += 1
 
-        # Parse
-        zepto_products = [p for item in (zepto_raw or []) if (p := extract_product_data(item, "zepto"))]
-        blinkit_products = [p for item in (blinkit_raw or []) if (p := extract_product_data(item, "blinkit"))]
+            # Hard timeout — send whatever we have
+            if elapsed > TOTAL_TIMEOUT:
+                if not zepto_done:
+                    zepto_task.cancel()
+                if not blinkit_done:
+                    blinkit_task.cancel()
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 92, 'message': 'Time limit reached, preparing results...'})}\n\n"
+                break
 
-        # Match
+            # Check completions
+            if blinkit_task.done() and not blinkit_done:
+                blinkit_done = True
+                try:
+                    blinkit_raw = blinkit_task.result() or []
+                except Exception:
+                    blinkit_raw = []
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 50, 'message': f'Blinkit done ({len(blinkit_raw)} products)!'})}\n\n"
+
+            if zepto_task.done() and not zepto_done:
+                zepto_done = True
+                try:
+                    zepto_raw = zepto_task.result() or []
+                except Exception:
+                    zepto_raw = []
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 50, 'message': f'Zepto done ({len(zepto_raw)} products)!'})}\n\n"
+
+            # Both done
+            if zepto_done and blinkit_done:
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 90, 'message': 'Both platforms done! Matching products...'})}\n\n"
+                break
+
+            # Progress based on time
+            progress = min(15 + int(elapsed / TOTAL_TIMEOUT * 70), 85)
+            if zepto_done or blinkit_done:
+                done_name = "Zepto" if zepto_done else "Blinkit"
+                waiting = "Blinkit" if zepto_done else "Zepto"
+                progress = max(progress, 55)
+                wait_msgs = [
+                    f"{done_name} ✓ — {waiting} scraping...",
+                    f"Waiting for {waiting} results...",
+                    f"{waiting} loading products...",
+                    f"Almost there — {waiting} finishing...",
+                    f"Hang tight — {waiting} data incoming...",
+                ]
+                msg = wait_msgs[poll_idx % len(wait_msgs)]
+            else:
+                secs = int(elapsed)
+                if secs < 8:
+                    msg = "Launching scrapers..."
+                elif secs < 20:
+                    msg = "Fetching live prices..."
+                elif secs < 35:
+                    msg = "Scraping product data..."
+                else:
+                    msg = f"Still working... ({secs}s)"
+
+            yield f"data: {json.dumps({'type': 'progress', 'percent': progress, 'message': msg})}\n\n"
+
+        # Process results
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 95, 'message': 'Comparing prices...'})}\n\n"
+
+        zepto_products = [p for item in zepto_raw if (p := extract_product_data(item, "zepto"))]
+        blinkit_products = [p for item in blinkit_raw if (p := extract_product_data(item, "blinkit"))]
+
         comparison = match_products(zepto_products, blinkit_products)
         matched_count = sum(1 for p in comparison if p["zepto"] and p["blinkit"])
-
         elapsed = round(time.time() - start_time, 1)
 
         inactive_info = [
@@ -833,9 +832,8 @@ async def search_stream(
 
         set_cache(cache_key, response_data)
 
-        yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': f'Found {len(comparison)} products in {elapsed}s!'})}\n\n"
+        yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': f'Done! {len(comparison[:MAX_PRODUCTS])} products in {elapsed}s'})}\n\n"
         await asyncio.sleep(0.2)
-
         yield f"data: {json.dumps({'type': 'result', 'data': response_data})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
